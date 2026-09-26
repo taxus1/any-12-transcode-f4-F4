@@ -1,6 +1,8 @@
 package com.somepro.application.job;
 
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.job.model.JobAttempt;
+import com.somepro.domain.job.model.JobStatus;
 import com.somepro.domain.job.model.TranscodeJob;
 import com.somepro.domain.job.repository.TranscodeJobRepository;
 import com.somepro.domain.media.model.AssetStatus;
@@ -13,12 +15,16 @@ import com.somepro.domain.shared.model.PageResult;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
+import java.time.LocalDateTime;
+import java.util.List;
+
 /**
- * 转码任务用例编排（应用层）：提交 / 撤销 / 查看 / 分页。
+ * 转码任务用例编排（应用层）：提交 / 撤销 / 节点领取 / 上报进度 / 上报结果 / 查看 / 分页。
  *
  * 不写业务规则（规则在领域层 TranscodeJob），只做编排：
  * - 提交前校验素材与档位状态、归属部门一致性、类型匹配、无同档位未完成任务；
  * - 并发重复提交与任务编号分配由仓储在事务里兜底（见 TranscodeJobRepository.submitNew）；
+ * - 领取 / 进度 / 结果的并发互斥由仓储的条件更新兜底（见 TranscodeJobRepository 各 *If* 方法）；
  * - 出入参都是领域对象，不认识 PO、也不认识 VO。
  */
 @Service
@@ -73,6 +79,69 @@ public class TranscodeJobAppService {
                     job.cancel(reason);
                     return transcodeJobRepository.cancelIfPending(job);
                 });
+    }
+
+    /**
+     * 节点领取任务：PENDING → RUNNING，素材跟着进转码中，同时记一条执行记录。
+     * 同一任务同一时刻只放一台节点；已被领走的、已出结果的再来领，都给明确提示挡回去。
+     */
+    public Mono<TranscodeJob> claim(Long id, String workerCode) {
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> {
+                    job.claim();
+                    // 执行记录与任务状态同事务落库：第几次跑 = 领取后的 attemptCount
+                    JobAttempt attempt = JobAttempt.start(job.getId(), job.getAttemptCount(),
+                            workerCode, job.getStartedAt());
+                    return transcodeJobRepository.claimIfPending(job, attempt);
+                });
+    }
+
+    /** 节点上报进度：0-100 的整数、只能往前；没被领走的任务不该收到进度。 */
+    public Mono<TranscodeJob> reportProgress(Long id, Integer progress) {
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> {
+                    job.reportProgress(progress);
+                    return transcodeJobRepository.reportProgressIfRunning(job);
+                });
+    }
+
+    /**
+     * 节点上报结果：SUCCESS 或 FAILED，可带产出路径 / 失败原因与结束时刻（缺省取当前时刻）。
+     * 成功素材留在转码中等人审，失败素材退回可转码；已出结果的任务不会再被改第二遍。
+     */
+    public Mono<TranscodeJob> reportResult(Long id, String result, String outputPath,
+                                           String errorMsg, LocalDateTime finishedAt) {
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> {
+                    if (isSuccess(result)) {
+                        job.succeed(outputPath, finishedAt);
+                    } else {
+                        job.fail(errorMsg, finishedAt);
+                    }
+                    return transcodeJobRepository.finishIfRunning(job);
+                });
+    }
+
+    /** 某任务的执行记录：第几次跑、哪台节点领的、几点开始、几点结束。 */
+    public Mono<List<JobAttempt>> listAttempts(Long id) {
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> transcodeJobRepository.listAttempts(id));
+    }
+
+    /** 结果参数只认 SUCCESS / FAILED（大小写不敏感），其余值直接挡回。 */
+    private static boolean isSuccess(String result) {
+        if (result == null || result.isBlank()) {
+            throw new BizException("结果不能为空（SUCCESS/FAILED）");
+        }
+        String normalized = result.trim().toUpperCase();
+        if (!JobStatus.SUCCESS.name().equals(normalized) && !JobStatus.FAILED.name().equals(normalized)) {
+            throw new BizException("结果只支持 SUCCESS/FAILED：" + result);
+        }
+        return JobStatus.SUCCESS.name().equals(normalized);
     }
 
     public Mono<TranscodeJob> get(Long id) {

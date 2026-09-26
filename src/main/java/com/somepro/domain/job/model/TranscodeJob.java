@@ -16,6 +16,9 @@ import java.time.LocalDateTime;
  * - 必须指定素材 id、档位 id、归属部门；优先级越小越先做（1-99，缺省 5）；
  * - 新提交的任务一律 PENDING（待处理，等节点来领），attemptCount=0、progress=0、maxAttempts=3，
  *   submittedAt 记提交时刻；
+ * - 只有 PENDING 能被节点领取（claim），领取后 RUNNING、记开始时刻、已尝试次数 +1；
+ * - 只有 RUNNING 能报进度、出结果；进度是 0-100 的整数且只能往前；
+ * - SUCCESS / FAILED / CANCELLED 都是终态：出了结果的任务不再接受任何上报，也不会再被领取；
  * - 撤销只能发生在 PENDING（还没被节点领走），且必须写明撤销原因；
  *   表里没有单独的取消原因列，原因落在 errorMsg；
  * - 任务编号 jobNo 形如 TJ-2026-0001，由仓储按年顺序分配（应用层不给编号）。
@@ -93,6 +96,84 @@ public class TranscodeJob extends BaseEntity {
         job.setSubmittedAt(LocalDateTime.now());
         job.validate();
         return job;
+    }
+
+    /**
+     * 领域行为：节点领取任务。
+     *
+     * - 只有 PENDING（还压在待处理里）的任务能领；已被领走的（RUNNING）、
+     *   已出结果的（SUCCESS/FAILED）、已撤销的（CANCELLED）都挡回去；
+     * - 领取后 RUNNING，startedAt 记开始时刻，progress 清零重新跑，attemptCount +1
+     *   （第几次跑，与执行记录 JobAttempt.attemptNo 对齐）。
+     *
+     * 注意：这里只校验「当前看到的状态」；几个节点同时来抢时，
+     * 由仓储的条件更新（WHERE status=PENDING）兜底，只放一台进去（见 claimIfPending）。
+     */
+    public void claim() {
+        if (status != JobStatus.PENDING) {
+            throw new BizException("只有待处理（PENDING）的任务才能被节点领取，当前状态：" + status);
+        }
+        this.status = JobStatus.RUNNING;
+        this.startedAt = LocalDateTime.now();
+        this.progress = 0;
+        this.attemptCount = this.attemptCount + 1;
+    }
+
+    /**
+     * 领域行为：节点上报进度。
+     *
+     * - 只有 RUNNING 能报：没被领走的（PENDING）不该收到进度，
+     *   已出结果的（SUCCESS/FAILED）不许再改；
+     * - 进度是 0-100 的整数，且只能往前：报得比当前小直接挡回去（报一样的不算回退）。
+     */
+    public void reportProgress(Integer progress) {
+        if (progress == null) {
+            throw new BizException("进度不能为空");
+        }
+        if (progress < 0 || progress > 100) {
+            throw new BizException("进度必须是 0-100 的整数：" + progress);
+        }
+        if (status != JobStatus.RUNNING) {
+            throw new BizException("只有处理中（RUNNING）的任务才能上报进度，当前状态：" + status);
+        }
+        if (progress < this.progress) {
+            throw new BizException("进度只能往前，不能回退：当前已 " + this.progress + "%，上报 " + progress + "%");
+        }
+        this.progress = progress;
+    }
+
+    /**
+     * 领域行为：节点上报成功。任务出终态 SUCCESS，进度顶到 100，记结束时刻（缺省取当前时刻）。
+     * 素材留在转码中等人审（素材联动在仓储层一并落库）。
+     */
+    public void succeed(String outputPath, LocalDateTime finishedAt) {
+        requireRunning();
+        this.status = JobStatus.SUCCESS;
+        this.progress = 100;
+        if (outputPath != null && !outputPath.isBlank()) {
+            this.outputPath = outputPath.trim();
+        }
+        this.finishedAt = finishedAt == null ? LocalDateTime.now() : finishedAt;
+    }
+
+    /**
+     * 领域行为：节点上报失败。任务出终态 FAILED，记失败原因与结束时刻（缺省取当前时刻）。
+     * 素材退回可转码（素材联动在仓储层一并落库），回头还能再提。
+     */
+    public void fail(String errorMsg, LocalDateTime finishedAt) {
+        requireRunning();
+        this.status = JobStatus.FAILED;
+        if (errorMsg != null && !errorMsg.isBlank()) {
+            this.errorMsg = errorMsg.trim();
+        }
+        this.finishedAt = finishedAt == null ? LocalDateTime.now() : finishedAt;
+    }
+
+    /** 出结果的前置守卫：只有 RUNNING 能出结果；已出结果的再来报，原样挡回、不做任何修改。 */
+    private void requireRunning() {
+        if (status != JobStatus.RUNNING) {
+            throw new BizException("只有处理中（RUNNING）的任务才能上报结果，当前状态：" + status);
+        }
     }
 
     /**

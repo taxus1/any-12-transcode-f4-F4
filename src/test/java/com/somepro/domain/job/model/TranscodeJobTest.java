@@ -61,4 +61,117 @@ class TranscodeJobTest {
         assertEquals("提错档位了", job.getErrorMsg());
         assertNotNull(job.getFinishedAt());
     }
+
+    @Test
+    void claimShouldTransitPendingToRunning() {
+        TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+
+        job.claim();
+
+        assertEquals(JobStatus.RUNNING, job.getStatus());
+        assertEquals(1, job.getAttemptCount());
+        assertEquals(0, job.getProgress());
+        assertNotNull(job.getStartedAt());
+    }
+
+    @Test
+    void claimShouldRejectNonPending() {
+        // 已被领走的、已出结果的、已撤销的，再来领都要挡回去
+        for (JobStatus status : new JobStatus[]{
+                JobStatus.RUNNING, JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.CANCELLED}) {
+            TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+            job.setStatus(status);
+
+            BizException e = assertThrows(BizException.class, job::claim);
+            assertEquals("只有待处理（PENDING）的任务才能被节点领取，当前状态：" + status, e.getMessage());
+        }
+    }
+
+    @Test
+    void reportProgressShouldRejectWhenNotClaimed() {
+        // 没被领走的任务不该收到进度
+        TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+
+        BizException e = assertThrows(BizException.class, () -> job.reportProgress(10));
+        assertEquals("只有处理中（RUNNING）的任务才能上报进度，当前状态：PENDING", e.getMessage());
+        assertEquals(0, job.getProgress());
+    }
+
+    @Test
+    void reportProgressShouldValidateRange() {
+        TranscodeJob job = claimedJob();
+
+        assertThrows(BizException.class, () -> job.reportProgress(null));
+        assertThrows(BizException.class, () -> job.reportProgress(-1));
+        assertThrows(BizException.class, () -> job.reportProgress(101));
+    }
+
+    @Test
+    void reportProgressShouldOnlyMoveForward() {
+        TranscodeJob job = claimedJob();
+
+        job.reportProgress(50);
+        assertEquals(50, job.getProgress());
+
+        // 报一样的不算回退，放行
+        job.reportProgress(50);
+        assertEquals(50, job.getProgress());
+
+        // 报得比上一次小，挡回去
+        BizException e = assertThrows(BizException.class, () -> job.reportProgress(40));
+        assertEquals("进度只能往前，不能回退：当前已 50%，上报 40%", e.getMessage());
+        assertEquals(50, job.getProgress());
+
+        job.reportProgress(100);
+        assertEquals(100, job.getProgress());
+    }
+
+    @Test
+    void succeedShouldMarkTerminalWithFinishedAt() {
+        TranscodeJob job = claimedJob();
+        job.reportProgress(80);
+
+        job.succeed(" /out/a.mp4 ", null);
+
+        assertEquals(JobStatus.SUCCESS, job.getStatus());
+        assertEquals(100, job.getProgress());
+        assertEquals("/out/a.mp4", job.getOutputPath());
+        assertNotNull(job.getFinishedAt());
+    }
+
+    @Test
+    void failShouldMarkTerminalWithReason() {
+        TranscodeJob job = claimedJob();
+
+        job.fail(" 转码器崩溃 ", null);
+
+        assertEquals(JobStatus.FAILED, job.getStatus());
+        assertEquals("转码器崩溃", job.getErrorMsg());
+        assertNotNull(job.getFinishedAt());
+    }
+
+    @Test
+    void finishShouldRejectWhenNotRunning() {
+        // 没被领走的任务不能出结果
+        TranscodeJob pending = TranscodeJob.submit(1L, 2L, "技术部", 1);
+        assertThrows(BizException.class, () -> pending.succeed(null, null));
+        assertThrows(BizException.class, () -> pending.fail("x", null));
+
+        // 已出结果的任务，后面再怎么报都不该把它重新改一遍
+        TranscodeJob job = claimedJob();
+        job.succeed("/out/a.mp4", null);
+        assertThrows(BizException.class, () -> job.succeed("/out/b.mp4", null));
+        assertThrows(BizException.class, () -> job.fail("又失败了", null));
+        assertThrows(BizException.class, () -> job.reportProgress(10));
+        assertEquals(JobStatus.SUCCESS, job.getStatus());
+        assertEquals(100, job.getProgress());
+        assertEquals("/out/a.mp4", job.getOutputPath());
+    }
+
+    /** 造一个已被节点领取的 RUNNING 任务。 */
+    private static TranscodeJob claimedJob() {
+        TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+        job.claim();
+        return job;
+    }
 }

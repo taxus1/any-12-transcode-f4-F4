@@ -1,8 +1,11 @@
 package com.somepro.domain.job.repository;
 
+import com.somepro.domain.job.model.JobAttempt;
 import com.somepro.domain.job.model.TranscodeJob;
 import com.somepro.domain.shared.model.PageResult;
 import reactor.core.publisher.Mono;
+
+import java.util.List;
 
 /**
  * 转码任务聚合的仓储端口：由领域层定义，基础设施层实现（端口-适配器）。
@@ -32,4 +35,31 @@ public interface TranscodeJobRepository {
      * 防止「查出来是待处理 → 节点同时领走 → 又被撤销」的并发窗口。
      */
     Mono<TranscodeJob> cancelIfPending(TranscodeJob job);
+
+    /**
+     * 领取落库（乐观条件更新，一个事务里三件事）：
+     * ① 仅当库里仍是 PENDING 才把任务改成 RUNNING —— 几个节点同时抢也只放一台，
+     *    其余 rows=0 给明确提示；已被领走的、已出结果的同样在这里被挡回；
+     * ② 对应素材跟着进转码中（TRANSCODING）；
+     * ③ 插入一条执行记录（第几次跑、哪台节点、几点开始）。
+     */
+    Mono<TranscodeJob> claimIfPending(TranscodeJob job, JobAttempt attempt);
+
+    /**
+     * 进度落库（乐观条件更新）：仅当库里仍是 RUNNING 且库里的进度不超过本次上报值才更新，
+     * 防止「读出来 50 → 另一上报已推进到 80 → 本次 60 把进度写回退」的并发窗口。
+     */
+    Mono<TranscodeJob> reportProgressIfRunning(TranscodeJob job);
+
+    /**
+     * 结果落库（乐观条件更新，一个事务里三件事）：
+     * ① 仅当库里仍是 RUNNING 才把任务改成终态（SUCCESS/FAILED）—— 已出结果的任务
+     *    后面再怎么报都不会被重新改一遍；
+     * ② 素材联动：成功留在转码中等人审（不动），失败退回可转码（READY）；
+     * ③ 当前这条执行记录跟着收尾（只更新，不新增）。
+     */
+    Mono<TranscodeJob> finishIfRunning(TranscodeJob job);
+
+    /** 某任务的执行记录（第几次跑、哪台节点、起止时刻），按 attemptNo 升序。 */
+    Mono<List<JobAttempt>> listAttempts(Long jobId);
 }

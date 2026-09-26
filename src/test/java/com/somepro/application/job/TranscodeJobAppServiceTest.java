@@ -1,6 +1,8 @@
 package com.somepro.application.job;
 
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.job.model.AttemptStatus;
+import com.somepro.domain.job.model.JobAttempt;
 import com.somepro.domain.job.model.JobStatus;
 import com.somepro.domain.job.model.TranscodeJob;
 import com.somepro.domain.job.repository.TranscodeJobRepository;
@@ -14,9 +16,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -166,5 +172,181 @@ class TranscodeJobAppServiceTest {
         assertEquals(JobStatus.CANCELLED, cancelled.getStatus());
         assertEquals("提错档位了", cancelled.getErrorMsg());
         verify(jobRepository).cancelIfPending(any());
+    }
+
+    private TranscodeJob pendingJob() {
+        TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+        job.setId(9L);
+        job.setJobNo("TJ-2026-0001");
+        return job;
+    }
+
+    private TranscodeJob runningJob() {
+        TranscodeJob job = pendingJob();
+        job.claim();
+        return job;
+    }
+
+    @Test
+    void claimShouldFailWhenJobMissing() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class, () -> service.claim(9L, "WK-001").block());
+        verify(jobRepository, never()).claimIfPending(any(), any());
+    }
+
+    @Test
+    void claimShouldFailWhenAlreadyClaimedOrFinished() {
+        // 已被领走的、已出结果的，再来领要挡回去
+        for (JobStatus status : new JobStatus[]{JobStatus.RUNNING, JobStatus.SUCCESS, JobStatus.FAILED}) {
+            TranscodeJob job = pendingJob();
+            job.setStatus(status);
+            when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+            assertThrows(BizException.class, () -> service.claim(9L, "WK-001").block());
+        }
+        verify(jobRepository, never()).claimIfPending(any(), any());
+    }
+
+    @Test
+    void claimShouldPersistRunningJobWithAttempt() {
+        TranscodeJob job = pendingJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.claimIfPending(any(), any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob claimed = service.claim(9L, "WK-001").block();
+
+        assertEquals(JobStatus.RUNNING, claimed.getStatus());
+        assertEquals(1, claimed.getAttemptCount());
+        assertNotNull(claimed.getStartedAt());
+        // 执行记录跟着落库：第几次跑、哪台节点、几点开始
+        verify(jobRepository).claimIfPending(any(), argThat(attempt ->
+                attempt.getJobId().equals(9L) && attempt.getAttemptNo() == 1
+                        && "WK-001".equals(attempt.getWorkerCode())
+                        && attempt.getStatus() == AttemptStatus.RUNNING
+                        && attempt.getStartedAt() != null));
+    }
+
+    @Test
+    void claimShouldFailWhenWorkerCodeBlank() {
+        TranscodeJob job = pendingJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        assertThrows(BizException.class, () -> service.claim(9L, "  ").block());
+        verify(jobRepository, never()).claimIfPending(any(), any());
+    }
+
+    @Test
+    void reportProgressShouldFailWhenNotClaimed() {
+        // 没被领走的任务不该收到进度
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(pendingJob()));
+
+        assertThrows(BizException.class, () -> service.reportProgress(9L, 30).block());
+        verify(jobRepository, never()).reportProgressIfRunning(any());
+    }
+
+    @Test
+    void reportProgressShouldRejectRegression() {
+        TranscodeJob job = runningJob();
+        job.reportProgress(50);
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        assertThrows(BizException.class, () -> service.reportProgress(9L, 40).block());
+        verify(jobRepository, never()).reportProgressIfRunning(any());
+    }
+
+    @Test
+    void reportProgressShouldPersistForwardProgress() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.reportProgressIfRunning(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob updated = service.reportProgress(9L, 60).block();
+
+        assertEquals(60, updated.getProgress());
+        verify(jobRepository).reportProgressIfRunning(any());
+    }
+
+    @Test
+    void reportResultShouldRejectInvalidResultValue() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(runningJob()));
+
+        assertThrows(BizException.class, () -> service.reportResult(9L, "OK", null, null, null).block());
+        assertThrows(BizException.class, () -> service.reportResult(9L, " ", null, null, null).block());
+        verify(jobRepository, never()).finishIfRunning(any());
+    }
+
+    @Test
+    void reportResultShouldFailWhenNotRunning() {
+        // 没被领走的任务不能出结果
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(pendingJob()));
+
+        assertThrows(BizException.class, () -> service.reportResult(9L, "SUCCESS", null, null, null).block());
+        verify(jobRepository, never()).finishIfRunning(any());
+    }
+
+    @Test
+    void reportResultSuccessShouldPersistTerminalJob() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.finishIfRunning(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob finished = service.reportResult(9L, "success", "/out/a.mp4", null, null).block();
+
+        assertEquals(JobStatus.SUCCESS, finished.getStatus());
+        assertEquals(100, finished.getProgress());
+        assertEquals("/out/a.mp4", finished.getOutputPath());
+        assertNotNull(finished.getFinishedAt());
+        verify(jobRepository).finishIfRunning(any());
+    }
+
+    @Test
+    void reportResultFailureShouldPersistTerminalJob() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.finishIfRunning(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob finished = service.reportResult(9L, "FAILED", null, "转码器崩溃", null).block();
+
+        assertEquals(JobStatus.FAILED, finished.getStatus());
+        assertEquals("转码器崩溃", finished.getErrorMsg());
+        assertNotNull(finished.getFinishedAt());
+        verify(jobRepository).finishIfRunning(any());
+    }
+
+    @Test
+    void reportResultShouldNotRewriteFinishedJob() {
+        // 已出结果的任务，后面再怎么报都不该把它重新改一遍
+        TranscodeJob job = runningJob();
+        job.succeed("/out/a.mp4", null);
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        assertThrows(BizException.class, () -> service.reportResult(9L, "FAILED", null, "x", null).block());
+        assertThrows(BizException.class, () -> service.reportProgress(9L, 10).block());
+        assertEquals(JobStatus.SUCCESS, job.getStatus());
+        verify(jobRepository, never()).finishIfRunning(any());
+        verify(jobRepository, never()).reportProgressIfRunning(any());
+    }
+
+    @Test
+    void listAttemptsShouldFailWhenJobMissing() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class, () -> service.listAttempts(9L).block());
+        verify(jobRepository, never()).listAttempts(any());
+    }
+
+    @Test
+    void listAttemptsShouldReturnRecords() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        JobAttempt attempt = JobAttempt.start(9L, 1, "WK-001", job.getStartedAt());
+        when(jobRepository.listAttempts(9L)).thenReturn(Mono.just(List.of(attempt)));
+
+        List<JobAttempt> attempts = service.listAttempts(9L).block();
+
+        assertEquals(1, attempts.size());
+        assertEquals("WK-001", attempts.get(0).getWorkerCode());
+        assertEquals(AttemptStatus.RUNNING, attempts.get(0).getStatus());
     }
 }
