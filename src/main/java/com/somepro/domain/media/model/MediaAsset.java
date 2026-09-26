@@ -86,6 +86,34 @@ public class MediaAsset extends BaseEntity {
         validate();
     }
 
+    /**
+     * 领域行为：素材进入转码中（任务被节点领取时）。
+     *
+     * READY → TRANSCODING；同一素材不同档位的任务可能并行，已在 TRANSCODING 的幂等放行；
+     * DONE（已完成）/ DISABLED（已停用）不允许再进转码。
+     */
+    public void startTranscoding() {
+        if (status == AssetStatus.DONE) {
+            throw new BizException("素材已完成转码，不能再进入转码中：" + id);
+        }
+        if (status == AssetStatus.DISABLED) {
+            throw new BizException("素材已停用，不能进入转码中：" + id);
+        }
+        this.status = AssetStatus.TRANSCODING;
+    }
+
+    /**
+     * 领域行为：转码失败，素材退回可转码（READY），之后可重新提交。
+     *
+     * 只有 TRANSCODING 能退回；其他状态说明素材已被别的流程改动，直接挡回。
+     */
+    public void returnToReady() {
+        if (status != AssetStatus.TRANSCODING) {
+            throw new BizException("只有转码中（TRANSCODING）的素材才能退回可转码，当前状态：" + status);
+        }
+        this.status = AssetStatus.READY;
+    }
+
     /** 聚合不变量：任何进入/离开领域的状态都要过这道校验。 */
     private void validate() {
         if (assetCode == null || assetCode.isBlank()) {

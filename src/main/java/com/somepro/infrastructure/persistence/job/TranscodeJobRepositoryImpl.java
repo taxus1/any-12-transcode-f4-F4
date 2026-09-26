@@ -6,15 +6,21 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.pagehelper.PageHelper;
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.job.model.AttemptStatus;
+import com.somepro.domain.job.model.JobAttempt;
 import com.somepro.domain.job.model.JobStatus;
 import com.somepro.domain.job.model.TranscodeJob;
 import com.somepro.domain.job.repository.TranscodeJobRepository;
+import com.somepro.domain.media.model.MediaAsset;
 import com.somepro.domain.shared.model.PageResult;
 import com.somepro.infrastructure.config.ReactiveOperatorContext;
 import com.somepro.infrastructure.persistence.audit.AuditContextHolder;
+import com.somepro.infrastructure.persistence.job.converter.JobAttemptPoConverter;
 import com.somepro.infrastructure.persistence.job.converter.TranscodeJobPoConverter;
+import com.somepro.infrastructure.persistence.job.po.JobAttemptPO;
 import com.somepro.infrastructure.persistence.job.po.TranscodeJobPO;
 import com.somepro.infrastructure.persistence.media.MediaAssetMapper;
+import com.somepro.infrastructure.persistence.media.converter.MediaAssetPoConverter;
 import com.somepro.infrastructure.persistence.media.po.MediaAssetPO;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Repository;
@@ -52,13 +58,16 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
 
     private final TranscodeJobMapper transcodeJobMapper;
     private final MediaAssetMapper mediaAssetMapper;
+    private final JobAttemptMapper jobAttemptMapper;
     private final TransactionTemplate transactionTemplate;
 
     public TranscodeJobRepositoryImpl(TranscodeJobMapper transcodeJobMapper,
                                       MediaAssetMapper mediaAssetMapper,
+                                      JobAttemptMapper jobAttemptMapper,
                                       PlatformTransactionManager transactionManager) {
         this.transcodeJobMapper = transcodeJobMapper;
         this.mediaAssetMapper = mediaAssetMapper;
+        this.jobAttemptMapper = jobAttemptMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -148,6 +157,87 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
             }
             return TranscodeJobPoConverter.toDomain(transcodeJobMapper.selectById(job.getId()));
         });
+    }
+
+    @Override
+    public Mono<TranscodeJob> claimIfPending(TranscodeJob job, JobAttempt attempt, MediaAsset asset) {
+        return blocking(() -> transactionTemplate.execute(status -> {
+            // ① 乐观条件更新：只有库里仍是 PENDING 的行才会被改成 RUNNING。
+            //    几个节点同时抢同一任务时，只有一台的 UPDATE 命中（影响 1 行），
+            //    其余影响 0 行 → 抛异常回滚：不会重复领取，也不会重复插执行记录。
+            TranscodeJobPO update = new TranscodeJobPO();
+            update.setStatus(job.getStatus().name());
+            update.setStartedAt(job.getStartedAt());
+            update.setAttemptCount(job.getAttemptCount());
+            int rows = transcodeJobMapper.update(update, Wrappers.<TranscodeJobPO>lambdaUpdate()
+                    .eq(TranscodeJobPO::getId, job.getId())
+                    .eq(TranscodeJobPO::getStatus, JobStatus.PENDING.name()));
+            if (rows == 0) {
+                throw new BizException("任务已被其他节点领取或已结束，领取失败：" + job.getJobNo());
+            }
+            // ② 素材跟着进转码中（领域行为已在应用层改过状态，这里只负责落库）
+            mediaAssetMapper.updateById(MediaAssetPoConverter.toPo(asset));
+            // ③ 记执行记录：第几次跑、哪台节点、几点开始；
+            //    uk_job_attempt(job_id, attempt_no) 唯一索引兜底，同事务内与任务状态同生共死
+            JobAttemptPO attemptPo = JobAttemptPoConverter.toPo(attempt);
+            attemptPo.setId(IdUtil.getSnowflakeNextId());
+            jobAttemptMapper.insert(attemptPo);
+            return TranscodeJobPoConverter.toDomain(transcodeJobMapper.selectById(job.getId()));
+        }));
+    }
+
+    @Override
+    public Mono<TranscodeJob> advanceProgress(TranscodeJob job) {
+        return blocking(() -> {
+            TranscodeJobPO update = new TranscodeJobPO();
+            update.setProgress(job.getProgress());
+            // 乐观条件更新：仍是 RUNNING 且库里进度不超过新进度才落。
+            // 挡住两类越界：① 任务已出终态后又来的进度；② 并发下后到的小进度把大进度冲掉。
+            int rows = transcodeJobMapper.update(update, Wrappers.<TranscodeJobPO>lambdaUpdate()
+                    .eq(TranscodeJobPO::getId, job.getId())
+                    .eq(TranscodeJobPO::getStatus, JobStatus.RUNNING.name())
+                    .le(TranscodeJobPO::getProgress, job.getProgress()));
+            if (rows == 0) {
+                throw new BizException("任务不在处理中或已有更新的进度，进度上报被拒绝：" + job.getJobNo());
+            }
+            return TranscodeJobPoConverter.toDomain(transcodeJobMapper.selectById(job.getId()));
+        });
+    }
+
+    @Override
+    public Mono<TranscodeJob> finishIfRunning(TranscodeJob job, JobAttempt attempt, MediaAsset asset) {
+        return blocking(() -> transactionTemplate.execute(status -> {
+            // ① 乐观条件更新：只有库里仍是 RUNNING 的行才能出结果。
+            //    任务一旦到了终态，之后任何结果上报都在这里影响 0 行被挡回，任务不会被重改。
+            TranscodeJobPO update = new TranscodeJobPO();
+            update.setStatus(job.getStatus().name());
+            update.setProgress(job.getProgress());
+            update.setOutputPath(job.getOutputPath());
+            update.setErrorMsg(job.getErrorMsg());
+            update.setFinishedAt(job.getFinishedAt());
+            int rows = transcodeJobMapper.update(update, Wrappers.<TranscodeJobPO>lambdaUpdate()
+                    .eq(TranscodeJobPO::getId, job.getId())
+                    .eq(TranscodeJobPO::getStatus, JobStatus.RUNNING.name()));
+            if (rows == 0) {
+                throw new BizException("任务不在处理中，结果上报被拒绝：" + job.getJobNo());
+            }
+            // ② 当前执行记录收尾：只落 status / errorMsg / finishedAt，且仅 RUNNING 的尝试可收尾。
+            //    ① 已成功说明任务刚才还在跑，对应尝试必为 RUNNING，此处必然命中；
+            //    任务到终态后领取只放 PENDING，不会再有新的执行记录，旧记录也不会再被触碰。
+            JobAttemptPO attemptUpdate = new JobAttemptPO();
+            attemptUpdate.setStatus(attempt.getStatus().name());
+            attemptUpdate.setErrorMsg(attempt.getErrorMsg());
+            attemptUpdate.setFinishedAt(attempt.getFinishedAt());
+            jobAttemptMapper.update(attemptUpdate, Wrappers.<JobAttemptPO>lambdaUpdate()
+                    .eq(JobAttemptPO::getJobId, attempt.getJobId())
+                    .eq(JobAttemptPO::getAttemptNo, attempt.getAttemptNo())
+                    .eq(JobAttemptPO::getStatus, AttemptStatus.RUNNING.name()));
+            // ③ 失败时素材退回可转码；asset 为 null（成功）时素材不动，留在转码中等人审
+            if (asset != null) {
+                mediaAssetMapper.updateById(MediaAssetPoConverter.toPo(asset));
+            }
+            return TranscodeJobPoConverter.toDomain(transcodeJobMapper.selectById(job.getId()));
+        }));
     }
 
     /** 同素材同档位的未完成任务数（PENDING/RUNNING）。 */

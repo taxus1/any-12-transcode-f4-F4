@@ -3,7 +3,9 @@ package com.somepro.interfaces.rest.job;
 import com.somepro.application.job.TranscodeJobAppService;
 import com.somepro.common.Result;
 import com.somepro.interfaces.rest.common.vo.PageVO;
+import com.somepro.interfaces.rest.job.converter.JobAttemptVoConverter;
 import com.somepro.interfaces.rest.job.converter.TranscodeJobVoConverter;
+import com.somepro.interfaces.rest.job.vo.JobAttemptVO;
 import com.somepro.interfaces.rest.job.vo.TranscodeJobVO;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -13,8 +15,11 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
+import java.util.List;
+import java.util.stream.Collectors;
+
 /**
- * 转码任务接口（用户接口层）：提交 / 撤销 / 查看 / 分页。
+ * 转码任务接口（用户接口层）：提交 / 撤销 / 领取 / 进度上报 / 结果上报 / 查看 / 分页。
  *
  * 只做协议适配（参数解析、VO 转换、返回包装），业务编排交给应用层：
  * - 统一返回 Mono<Result<T>>；
@@ -49,6 +54,51 @@ public class TranscodeJobController {
                                                @RequestParam(required = false) String reason) {
         return transcodeJobAppService.cancel(id, reason)
                 .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 节点领取任务：PENDING → RUNNING，素材跟着进转码中，并记一条执行记录。
+     * 同一任务同一时刻只放一台节点；已被领走 / 已出结果 / 已取消的再来领会被明确挡回。
+     */
+    @PostMapping("/{id}/claim")
+    public Mono<Result<TranscodeJobVO>> claim(@PathVariable Long id,
+                                              @RequestParam String workerCode) {
+        return transcodeJobAppService.claim(id, workerCode)
+                .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /** 节点上报进度：0-100 的整数、只能往前；任务没在处理中或进度倒退都会被挡回。 */
+    @PostMapping("/{id}/progress")
+    public Mono<Result<TranscodeJobVO>> reportProgress(@PathVariable Long id,
+                                                       @RequestParam Integer progress) {
+        return transcodeJobAppService.reportProgress(id, progress)
+                .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 节点上报结果：result=SUCCESS（可带 outputPath）/ FAILED（必须带 errorMsg）。
+     * 任务一旦出了结果，后续上报一律被挡回，任务与执行记录都不会再变。
+     */
+    @PostMapping("/{id}/result")
+    public Mono<Result<TranscodeJobVO>> reportResult(@PathVariable Long id,
+                                                     @RequestParam String result,
+                                                     @RequestParam(required = false) String outputPath,
+                                                     @RequestParam(required = false) String errorMsg) {
+        return transcodeJobAppService.reportResult(id, result, outputPath, errorMsg)
+                .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /** 任务的执行记录列表：第几次跑、哪台节点领的、几点开始/结束。 */
+    @GetMapping("/{id}/attempts")
+    public Mono<Result<List<JobAttemptVO>>> attempts(@PathVariable Long id) {
+        return transcodeJobAppService.listAttempts(id)
+                .map(attempts -> attempts.stream()
+                        .map(JobAttemptVoConverter::toVo)
+                        .collect(Collectors.toList()))
                 .map(Result::ok);
     }
 

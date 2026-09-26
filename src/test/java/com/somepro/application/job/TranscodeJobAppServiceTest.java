@@ -3,6 +3,7 @@ package com.somepro.application.job;
 import com.somepro.common.exception.BizException;
 import com.somepro.domain.job.model.JobStatus;
 import com.somepro.domain.job.model.TranscodeJob;
+import com.somepro.domain.job.repository.JobAttemptRepository;
 import com.somepro.domain.job.repository.TranscodeJobRepository;
 import com.somepro.domain.media.model.AssetStatus;
 import com.somepro.domain.media.model.MediaAsset;
@@ -14,9 +15,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -30,6 +35,7 @@ class TranscodeJobAppServiceTest {
     private TranscodeJobRepository jobRepository;
     private MediaAssetRepository assetRepository;
     private TranscodeProfileRepository profileRepository;
+    private JobAttemptRepository attemptRepository;
     private TranscodeJobAppService service;
 
     @BeforeEach
@@ -37,7 +43,9 @@ class TranscodeJobAppServiceTest {
         jobRepository = mock(TranscodeJobRepository.class);
         assetRepository = mock(MediaAssetRepository.class);
         profileRepository = mock(TranscodeProfileRepository.class);
-        service = new TranscodeJobAppService(jobRepository, assetRepository, profileRepository);
+        attemptRepository = mock(JobAttemptRepository.class);
+        service = new TranscodeJobAppService(jobRepository, assetRepository, profileRepository,
+                attemptRepository);
     }
 
     private MediaAsset readyAsset() {
@@ -166,5 +174,191 @@ class TranscodeJobAppServiceTest {
         assertEquals(JobStatus.CANCELLED, cancelled.getStatus());
         assertEquals("提错档位了", cancelled.getErrorMsg());
         verify(jobRepository).cancelIfPending(any());
+    }
+
+    // ============ 领取：PENDING → RUNNING，素材进转码中，记执行记录 ============
+
+    private TranscodeJob pendingJob() {
+        TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+        job.setId(9L);
+        job.setJobNo("TJ-2026-0001");
+        return job;
+    }
+
+    private TranscodeJob runningJob() {
+        TranscodeJob job = pendingJob();
+        job.claim("WK-001");
+        return job;
+    }
+
+    @Test
+    void claimShouldFailWhenJobMissing() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class, () -> service.claim(9L, "WK-001").block());
+        verify(jobRepository, never()).claimIfPending(any(), any(), any());
+    }
+
+    @Test
+    void claimShouldPersistRunningJobWithAttemptAndTranscodingAsset() {
+        TranscodeJob job = pendingJob();
+        MediaAsset asset = readyAsset();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(assetRepository.findById(1L)).thenReturn(Mono.just(asset));
+        when(jobRepository.claimIfPending(any(), any(), any()))
+                .thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob claimed = service.claim(9L, "WK-001").block();
+
+        // 任务进处理中
+        assertEquals(JobStatus.RUNNING, claimed.getStatus());
+        assertEquals(1, claimed.getAttemptCount());
+        // 落库时素材跟着进转码中、执行记录一并带上
+        verify(jobRepository).claimIfPending(any(),
+                org.mockito.ArgumentMatchers.argThat(a ->
+                        a.getAttemptNo() == 1 && "WK-001".equals(a.getWorkerCode())
+                                && a.getStartedAt() != null),
+                org.mockito.ArgumentMatchers.argThat(a -> a.getStatus() == AssetStatus.TRANSCODING));
+    }
+
+    @Test
+    void claimShouldRejectAlreadyClaimedOrFinished() {
+        // 已被领走的（RUNNING）再来领要挡回去
+        TranscodeJob running = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(running));
+        when(assetRepository.findById(1L)).thenReturn(Mono.just(readyAsset()));
+        assertThrows(BizException.class, () -> service.claim(9L, "WK-002").block());
+
+        // 已出结果的再来领也要挡回去
+        TranscodeJob finished = runningJob();
+        finished.completeSuccess("/out/a.mp4");
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(finished));
+        assertThrows(BizException.class, () -> service.claim(9L, "WK-002").block());
+
+        verify(jobRepository, never()).claimIfPending(any(), any(), any());
+    }
+
+    // ============ 进度：只能往前；没被领走 / 已出结果的不该收到进度 ============
+
+    @Test
+    void reportProgressShouldAdvance() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.advanceProgress(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob updated = service.reportProgress(9L, 45).block();
+
+        assertEquals(45, updated.getProgress());
+        verify(jobRepository).advanceProgress(any());
+    }
+
+    @Test
+    void reportProgressShouldRejectPendingJob() {
+        // 没被领走的任务不该收到进度
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(pendingJob()));
+
+        assertThrows(BizException.class, () -> service.reportProgress(9L, 10).block());
+        verify(jobRepository, never()).advanceProgress(any());
+    }
+
+    @Test
+    void reportProgressShouldRejectRegression() {
+        TranscodeJob job = runningJob();
+        job.reportProgress(60);
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        assertThrows(BizException.class, () -> service.reportProgress(9L, 30).block());
+        verify(jobRepository, never()).advanceProgress(any());
+    }
+
+    // ============ 结果：成功素材留转码中，失败退回可转码；终态后不再变 ============
+
+    @Test
+    void reportSuccessShouldKeepAssetTranscoding() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(jobRepository.finishIfRunning(any(), any(), isNull()))
+                .thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob finished = service.reportResult(9L, "SUCCESS", "/out/a.mp4", null).block();
+
+        assertEquals(JobStatus.SUCCESS, finished.getStatus());
+        assertEquals(100, finished.getProgress());
+        assertNotNull(finished.getFinishedAt());
+        // 成功：素材留在转码中等人审（asset 传 null，不动素材）
+        verify(jobRepository).finishIfRunning(any(),
+                org.mockito.ArgumentMatchers.argThat(a -> a.getStatus().name().equals("SUCCESS")),
+                isNull());
+        verify(assetRepository, never()).save(any());
+    }
+
+    @Test
+    void reportFailureShouldReturnAssetToReady() {
+        TranscodeJob job = runningJob();
+        MediaAsset asset = readyAsset();
+        asset.startTranscoding();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(assetRepository.findById(1L)).thenReturn(Mono.just(asset));
+        when(jobRepository.finishIfRunning(any(), any(), any()))
+                .thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob finished = service.reportResult(9L, "FAILED", null, "解码失败").block();
+
+        assertEquals(JobStatus.FAILED, finished.getStatus());
+        assertEquals("解码失败", finished.getErrorMsg());
+        assertNotNull(finished.getFinishedAt());
+        // 失败：素材退回可转码，回头还能再提
+        verify(jobRepository).finishIfRunning(any(), any(),
+                org.mockito.ArgumentMatchers.argThat(a -> a.getStatus() == AssetStatus.READY));
+    }
+
+    @Test
+    void reportResultShouldRejectInvalidResult() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(runningJob()));
+
+        assertThrows(BizException.class, () -> service.reportResult(9L, "RUNNING", null, null).block());
+        assertThrows(BizException.class, () -> service.reportResult(9L, "DONE", null, null).block());
+        verify(jobRepository, never()).finishIfRunning(any(), any(), any());
+    }
+
+    @Test
+    void reportResultShouldRejectFinishedJobWithoutSideEffects() {
+        // 任务一旦出了结果，后面再怎么报都不该把它重新改一遍，执行记录也别再跟着多出来
+        TranscodeJob job = runningJob();
+        job.completeSuccess("/out/a.mp4");
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        assertThrows(BizException.class, () -> service.reportResult(9L, "FAILED", null, "又失败了").block());
+        assertThrows(BizException.class, () -> service.reportProgress(9L, 99).block());
+
+        verify(jobRepository, never()).finishIfRunning(any(), any(), any());
+        verify(jobRepository, never()).advanceProgress(any());
+        // 任务保持第一次的结果不变
+        assertEquals(JobStatus.SUCCESS, job.getStatus());
+        assertEquals("/out/a.mp4", job.getOutputPath());
+    }
+
+    // ============ 执行记录查询 ============
+
+    @Test
+    void listAttemptsShouldFailWhenJobMissing() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class, () -> service.listAttempts(9L).block());
+        verify(attemptRepository, never()).listByJobId(any());
+    }
+
+    @Test
+    void listAttemptsShouldReturnRecords() {
+        TranscodeJob job = runningJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        when(attemptRepository.listByJobId(9L)).thenReturn(Mono.just(List.of(
+                com.somepro.domain.job.model.JobAttempt.start(9L, 1, "WK-001"))));
+
+        var attempts = service.listAttempts(9L).block();
+
+        assertEquals(1, attempts.size());
+        assertEquals("WK-001", attempts.get(0).getWorkerCode());
+        assertEquals(1, attempts.get(0).getAttemptNo());
     }
 }
